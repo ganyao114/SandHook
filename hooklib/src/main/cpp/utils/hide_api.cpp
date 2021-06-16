@@ -8,6 +8,8 @@
 #include "../includes/utils.h"
 #include "../includes/trampoline_manager.h"
 #include "../includes/art_runtime.h"
+#include <unordered_set>
+#include <mutex>
 
 extern int SDK_INT;
 
@@ -38,12 +40,28 @@ extern "C" {
         return origin_DecodeArtMethodId(thiz, jmethodId);
     }
 
+    std::unordered_set<ArtMethod*> pending_methods;
+    std::mutex pending_mutex;
+    void addPendingHookNative(ArtMethod *method) {
+        std::unique_lock<std::mutex> lk(pending_mutex);
+        pending_methods.insert(method);
+    }
+
+    bool isPending(ArtMethod* method) {
+        std::unique_lock<std::mutex> lk(pending_mutex);
+        return pending_methods.erase(method);
+    }
+
     bool (*origin_ShouldUseInterpreterEntrypoint)(ArtMethod *artMethod, const void* quick_code) = nullptr;
     bool replace_ShouldUseInterpreterEntrypoint(ArtMethod *artMethod, const void* quick_code) {
-        if (SandHook::TrampolineManager::get().methodHooked(artMethod) && quick_code != nullptr) {
+        if ((SandHook::TrampolineManager::get().methodHooked(artMethod) || isPending(artMethod)) && quick_code != nullptr) {
             return false;
         }
         return origin_ShouldUseInterpreterEntrypoint(artMethod, quick_code);
+    }
+
+    int replace_hidden_api(){
+        return 0;
     }
 
     // paths
@@ -57,6 +75,8 @@ extern "C" {
     void (*class_init_callback)(void*) = nullptr;
 
     void (*backup_fixup_static_trampolines)(void *, void *) = nullptr;
+
+    void (*backup_fixup_static_trampolines_with_thread)(void *, void *, void*) = nullptr;
 
     void *(*backup_mark_class_initialized)(void *, void *, uint32_t *) = nullptr;
 
@@ -178,6 +198,24 @@ extern "C" {
                                                                                   const void *)>(hook_native(
                         shouldUseInterpreterEntrypoint,
                         reinterpret_cast<void *>(replace_ShouldUseInterpreterEntrypoint)));
+            }
+        }
+
+        if (SDK_INT >= ANDROID_Q && hook_native) {
+            if (void* hidden_api = getSymCompat(art_lib_path, "_ZN3art9hiddenapi6detail28ShouldDenyAccessToMemberImplINS_9ArtMethodEEEbPT_NS0_7ApiListENS0_12AccessMethodE")) {
+                hook_native(hidden_api, reinterpret_cast<void*>(replace_hidden_api));
+            }
+            if (void* hidden_api = getSymCompat(art_lib_path, "_ZN3art9hiddenapi6detail28ShouldDenyAccessToMemberImplINS_8ArtFieldEEEbPT_NS0_7ApiListENS0_12AccessMethodE")) {
+                hook_native(hidden_api, reinterpret_cast<void*>(replace_hidden_api));
+            }
+        }
+
+        if (SDK_INT == ANDROID_P && hook_native) {
+            if (void* hidden_api = getSymCompat(art_lib_path, "_ZN3art9hiddenapi6detail19GetMemberActionImplINS_9ArtMethodEEENS0_6ActionEPT_NS_20HiddenApiAccessFlags7ApiListES4_NS0_12AccessMethodE")) {
+                hook_native(hidden_api, reinterpret_cast<void*>(replace_hidden_api));
+            }
+            if (void* hidden_api = getSymCompat(art_lib_path, "_ZN3art9hiddenapi6detail19GetMemberActionImplINS_8ArtFieldEEENS0_6ActionEPT_NS_20HiddenApiAccessFlags7ApiListES4_NS0_12AccessMethodE")) {
+                hook_native(hidden_api, reinterpret_cast<void*>(replace_hidden_api));
             }
         }
 
@@ -324,6 +362,12 @@ extern "C" {
             class_init_callback(clazz_ptr);
         }
     }
+    void replaceFixupStaticTrampolinesWithThread(void *thiz, void* self, void *clazz_ptr) {
+        backup_fixup_static_trampolines_with_thread(thiz, self, clazz_ptr);
+        if (class_init_callback) {
+            class_init_callback(clazz_ptr);
+        }
+    }
 
     void *replaceMarkClassInitialized(void * thiz, void * self, uint32_t * clazz_ptr) {
         auto result = backup_mark_class_initialized(thiz, self, clazz_ptr);
@@ -374,7 +418,17 @@ extern "C" {
             make_initialized_classes_visibly_initialized_ = reinterpret_cast<void* (*)(void*, void*, bool)>(
                     getSymCompat(art_lib_path, "_ZN3art11ClassLinker40MakeInitializedClassesVisiblyInitializedEPNS_6ThreadEb"));
 
-            if (backup_mark_class_initialized && backup_update_methods_code) {
+            if (void *symFixupStaticTrampolines = getSymCompat(art_lib_path,
+                                                           "_ZN3art11ClassLinker22FixupStaticTrampolinesENS_6ObjPtrINS_6mirror5ClassEEE"))
+                backup_fixup_static_trampolines = reinterpret_cast<void (*)(void *, void *)>(hook_native(
+                    symFixupStaticTrampolines, (void *) replaceFixupStaticTrampolines));
+
+            if (void *symFixupStaticTrampolinesWithThread = getSymCompat(art_lib_path,
+                                                           "_ZN3art11ClassLinker22FixupStaticTrampolinesEPNS_6ThreadENS_6ObjPtrINS_6mirror5ClassEEE"))
+                backup_fixup_static_trampolines_with_thread = reinterpret_cast<void (*)(void *,void *, void*)>(hook_native(
+                    symFixupStaticTrampolinesWithThread, (void *) replaceFixupStaticTrampolinesWithThread));
+
+            if (backup_mark_class_initialized && backup_update_methods_code && (backup_fixup_static_trampolines_with_thread || backup_fixup_static_trampolines)) {
                 class_init_callback = callback;
                 return true;
             } else {
